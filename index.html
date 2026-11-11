@@ -859,8 +859,8 @@ function updateNetworkStatus(s) {
 }
 
 function handleConnectEnter() {
-  if (!onlineState.showRoomCode) { if (onlineState.phase === 'idle') connectToServer(); }
-  else if (onlineState.roomCode.length === 6 && netClient.connected) netClient.joinRoom(onlineState.roomCode, p1CharIdx);
+  if (!netClient.connected) { if (onlineState.phase === 'idle') connectToServer(); }
+  else if (onlineState.showRoomCode && onlineState.roomCode.length === 6) netClient.joinRoom(onlineState.roomCode, p1CharIdx);
 }
 
 async function connectToServer() {
@@ -868,7 +868,7 @@ async function connectToServer() {
   try {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     await netClient.connect(`${proto}//${location.host}`);
-    updateNetworkStatus('connected'); onlineState.phase = 'idle'; onlineState.showRoomCode = true;
+    updateNetworkStatus('connected'); onlineState.phase = 'idle'; onlineState.showRoomCode = false;
     netClient.showMessage('已连接！按 1 创建房间，按 2 输入房间号');
   } catch(e) { updateNetworkStatus('disconnected'); onlineState.phase = 'idle'; onlineState.message = '连接失败: ' + e.message; onlineState.messageTimer = 180; }
 }
