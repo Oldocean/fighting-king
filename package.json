@@ -1,0 +1,15 @@
+{
+  "name": "fighting-king-online",
+  "version": "2.0.0",
+  "description": "格斗之王 - 支持人机对战和远程联机",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.0"
+  },
+  "author": "Fighting King",
+  "license": "MIT"
+}

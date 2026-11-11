@@ -1,0 +1,1323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>格斗之王 v2.0 - Fighting King Online</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0a;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-family: 'Courier New', monospace;
+  overflow: hidden;
+}
+#gameCanvas {
+  border: 3px solid #333;
+  image-rendering: pixelated;
+  cursor: none;
+}
+#controls {
+  color: #888;
+  font-size: 11px;
+  margin-top: 12px;
+  text-align: center;
+  line-height: 1.8;
+}
+#controls span { color: #ffcc00; }
+#network-status {
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: monospace;
+  display: none;
+  z-index: 100;
+}
+.status-connected { background: #1a4a1a; color: #44ff44; border: 1px solid #44ff44; }
+.status-disconnected { background: #4a1a1a; color: #ff4444; border: 1px solid #ff4444; }
+.status-connecting { background: #4a4a1a; color: #ffcc00; border: 1px solid #ffcc00; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="960" height="540"></canvas>
+<div id="network-status"></div>
+<div id="controls">
+  <span>P1</span>: A/D 移动 | W 跳跃 | S 蹲下 | J 拳 | K 腿 | L 必杀技 | U 防御<br>
+  <span>P2</span>: ←/→ 移动 | ↑ 跳跃 | ↓ 蹲下 | 1 拳 | 2 腿 | 3 必杀技 | 0 防御<br>
+  <span>ENTER</span> 确认 | <span>ESC</span> 返回菜单 | <span>M</span> 静音切换
+</div>
+
+<script>
+// ============================================================
+// 格斗之王 v2.0 - Fighting King Online
+// 支持: 本地双人 / 人机对战 / 在线对战
+// ============================================================
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const GROUND = H - 80;
+const GRAVITY = 0.6;
+
+// ============================================================
+// 音效系统 - Web Audio API 程序化生成
+// ============================================================
+class SoundSystem {
+  constructor() {
+    this.ctx = null;
+    this.masterVolume = 0.5;
+    this.bgmVolume = 0.3;
+    this.sfxVolume = 0.6;
+    this.muted = false;
+    this.bgmNode = null;
+    this.bgmGain = null;
+    this.bgmPlaying = false;
+    this.currentBgm = null;
+  }
+
+  init() {
+    if (this.ctx) return;
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = this.masterVolume;
+      this.masterGain.connect(this.ctx.destination);
+      
+      this.bgmGain = this.ctx.createGain();
+      this.bgmGain.gain.value = this.bgmVolume;
+      this.bgmGain.connect(this.masterGain);
+      
+      this.sfxGain = this.ctx.createGain();
+      this.sfxGain.gain.value = this.sfxVolume;
+      this.sfxGain.connect(this.masterGain);
+    } catch(e) {
+      console.warn('Web Audio API not supported');
+    }
+  }
+
+  resume() {
+    if (this.ctx && this.ctx.state === 'suspended') {
+      this.ctx.resume();
+    }
+  }
+
+  // 创建噪声缓冲区
+  createNoiseBuffer(duration = 1) {
+    const sampleRate = this.ctx.sampleRate;
+    const length = sampleRate * duration;
+    const buffer = this.ctx.createBuffer(1, length, sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < length; i++) {
+      data[i] = Math.random() * 2 - 1;
+    }
+    return buffer;
+  }
+
+  // 拳击命中音效
+  playPunchHit() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 低频冲击
+    const osc1 = this.ctx.createOscillator();
+    const gain1 = this.ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(150, t);
+    osc1.frequency.exponentialRampToValueAtTime(50, t + 0.1);
+    gain1.gain.setValueAtTime(0.8, t);
+    gain1.gain.exponentialRampToValueAtTime(0.01, t + 0.15);
+    osc1.connect(gain1);
+    gain1.connect(this.sfxGain);
+    osc1.start(t);
+    osc1.stop(t + 0.15);
+    
+    // 噪声打击
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = this.createNoiseBuffer(0.1);
+    const noiseGain = this.ctx.createGain();
+    const noiseFilter = this.ctx.createBiquadFilter();
+    noiseFilter.type = 'bandpass';
+    noiseFilter.frequency.value = 2000;
+    noiseFilter.Q.value = 2;
+    noiseGain.gain.setValueAtTime(0.5, t);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01, t + 0.08);
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(this.sfxGain);
+    noise.start(t);
+    noise.stop(t + 0.1);
+  }
+
+  // 踢击命中音效（更重）
+  playKickHit() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 更低频的冲击
+    const osc1 = this.ctx.createOscillator();
+    const gain1 = this.ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(100, t);
+    osc1.frequency.exponentialRampToValueAtTime(30, t + 0.2);
+    gain1.gain.setValueAtTime(1.0, t);
+    gain1.gain.exponentialRampToValueAtTime(0.01, t + 0.25);
+    osc1.connect(gain1);
+    gain1.connect(this.sfxGain);
+    osc1.start(t);
+    osc1.stop(t + 0.25);
+    
+    // 更重的噪声
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = this.createNoiseBuffer(0.15);
+    const noiseGain = this.ctx.createGain();
+    const noiseFilter = this.ctx.createBiquadFilter();
+    noiseFilter.type = 'lowpass';
+    noiseFilter.frequency.value = 1500;
+    noiseGain.gain.setValueAtTime(0.7, t);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01, t + 0.12);
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(this.sfxGain);
+    noise.start(t);
+    noise.stop(t + 0.15);
+  }
+
+  // 防御格挡音效
+  playBlock() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 金属碰撞声
+    const osc1 = this.ctx.createOscillator();
+    const osc2 = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    
+    osc1.type = 'square';
+    osc1.frequency.setValueAtTime(800, t);
+    osc1.frequency.exponentialRampToValueAtTime(400, t + 0.1);
+    
+    osc2.type = 'square';
+    osc2.frequency.setValueAtTime(1200, t);
+    osc2.frequency.exponentialRampToValueAtTime(600, t + 0.1);
+    
+    gain.gain.setValueAtTime(0.3, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.15);
+    
+    osc1.connect(gain);
+    osc2.connect(gain);
+    gain.connect(this.sfxGain);
+    
+    osc1.start(t);
+    osc2.start(t);
+    osc1.stop(t + 0.15);
+    osc2.stop(t + 0.15);
+  }
+
+  // 必杀技释放音效
+  playSpecial() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 能量充能上升
+    const osc1 = this.ctx.createOscillator();
+    const gain1 = this.ctx.createGain();
+    osc1.type = 'sawtooth';
+    osc1.frequency.setValueAtTime(200, t);
+    osc1.frequency.exponentialRampToValueAtTime(800, t + 0.2);
+    osc1.frequency.exponentialRampToValueAtTime(400, t + 0.4);
+    gain1.gain.setValueAtTime(0.01, t);
+    gain1.gain.linearRampToValueAtTime(0.5, t + 0.15);
+    gain1.gain.exponentialRampToValueAtTime(0.01, t + 0.5);
+    osc1.connect(gain1);
+    gain1.connect(this.sfxGain);
+    osc1.start(t);
+    osc1.stop(t + 0.5);
+    
+    // 爆发噪声
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = this.createNoiseBuffer(0.3);
+    const noiseGain = this.ctx.createGain();
+    const noiseFilter = this.ctx.createBiquadFilter();
+    noiseFilter.type = 'bandpass';
+    noiseFilter.frequency.setValueAtTime(500, t);
+    noiseFilter.frequency.exponentialRampToValueAtTime(2000, t + 0.2);
+    noiseFilter.Q.value = 5;
+    noiseGain.gain.setValueAtTime(0.01, t);
+    noiseGain.gain.linearRampToValueAtTime(0.6, t + 0.15);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01, t + 0.4);
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(this.sfxGain);
+    noise.start(t);
+    noise.stop(t + 0.4);
+  }
+
+  // 跳跃音效
+  playJump() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(200, t);
+    osc.frequency.exponentialRampToValueAtTime(600, t + 0.1);
+    gain.gain.setValueAtTime(0.3, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.12);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.12);
+  }
+
+  // KO 音效
+  playKO() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 沉重打击
+    const osc1 = this.ctx.createOscillator();
+    const gain1 = this.ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.setValueAtTime(80, t);
+    osc1.frequency.exponentialRampToValueAtTime(20, t + 0.5);
+    gain1.gain.setValueAtTime(1.0, t);
+    gain1.gain.exponentialRampToValueAtTime(0.01, t + 0.6);
+    osc1.connect(gain1);
+    gain1.connect(this.sfxGain);
+    osc1.start(t);
+    osc1.stop(t + 0.6);
+    
+    // 爆炸噪声
+    const noise = this.ctx.createBufferSource();
+    noise.buffer = this.createNoiseBuffer(0.5);
+    const noiseGain = this.ctx.createGain();
+    const noiseFilter = this.ctx.createBiquadFilter();
+    noiseFilter.type = 'lowpass';
+    noiseFilter.frequency.setValueAtTime(3000, t);
+    noiseFilter.frequency.exponentialRampToValueAtTime(200, t + 0.4);
+    noiseGain.gain.setValueAtTime(0.8, t);
+    noiseGain.gain.exponentialRampToValueAtTime(0.01, t + 0.5);
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(this.sfxGain);
+    noise.start(t);
+    noise.stop(t + 0.5);
+  }
+
+  // 回合开始音效
+  playRoundStart() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 三声提示音
+    for (let i = 0; i < 3; i++) {
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = 440 + i * 110;
+      gain.gain.setValueAtTime(0, t + i * 0.15);
+      gain.gain.linearRampToValueAtTime(0.3, t + i * 0.15 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.01, t + i * 0.15 + 0.12);
+      osc.connect(gain);
+      gain.connect(this.sfxGain);
+      osc.start(t + i * 0.15);
+      osc.stop(t + i * 0.15 + 0.12);
+    }
+  }
+
+  // FIGHT! 音效
+  playFight() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    // 激昂的和弦
+    const freqs = [261.63, 329.63, 392.00, 523.25]; // C E G C
+    freqs.forEach((f, i) => {
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.value = f;
+      gain.gain.setValueAtTime(0.01, t);
+      gain.gain.linearRampToValueAtTime(0.2, t + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.01, t + 0.4);
+      osc.connect(gain);
+      gain.connect(this.sfxGain);
+      osc.start(t);
+      osc.stop(t + 0.4);
+    });
+  }
+
+  // 菜单选择音效
+  playMenuSelect() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(600, t);
+    osc.frequency.setValueAtTime(800, t + 0.05);
+    gain.gain.setValueAtTime(0.2, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.1);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.1);
+  }
+
+  // 菜单确认音效
+  playMenuConfirm() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    const osc1 = this.ctx.createOscillator();
+    const osc2 = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.value = 523.25;
+    osc2.type = 'sine';
+    osc2.frequency.value = 659.25;
+    gain.gain.setValueAtTime(0.3, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.2);
+    osc1.connect(gain);
+    osc2.connect(gain);
+    gain.connect(this.sfxGain);
+    osc1.start(t);
+    osc2.start(t);
+    osc1.stop(t + 0.2);
+    osc2.stop(t + 0.2);
+  }
+
+  // 飞行道具音效
+  playProjectile() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(300, t);
+    osc.frequency.exponentialRampToValueAtTime(100, t + 0.3);
+    gain.gain.setValueAtTime(0.2, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.3);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    osc.start(t);
+    osc.stop(t + 0.3);
+  }
+
+  // 胜利音效
+  playVictory() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    
+    const melody = [523.25, 659.25, 783.99, 1046.50]; // C E G C
+    melody.forEach((f, i) => {
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = f;
+      gain.gain.setValueAtTime(0, t + i * 0.15);
+      gain.gain.linearRampToValueAtTime(0.25, t + i * 0.15 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.01, t + i * 0.15 + 0.3);
+      osc.connect(gain);
+      gain.connect(this.sfxGain);
+      osc.start(t + i * 0.15);
+      osc.stop(t + i * 0.15 + 0.3);
+    });
+  }
+
+  // ============================================================
+  // 背景音乐系统
+  // ============================================================
+  
+  // 停止当前BGM
+  stopBgm() {
+    if (this.bgmNode) {
+      try {
+        this.bgmNode.stop();
+      } catch(e) {}
+      this.bgmNode = null;
+    }
+    this.bgmPlaying = false;
+    this.currentBgm = null;
+  }
+
+  // 播放菜单BGM - 轻松氛围
+  playMenuBgm() {
+    if (!this.ctx || this.currentBgm === 'menu') return;
+    this.stopBgm();
+    this.currentBgm = 'menu';
+    this.bgmPlaying = true;
+    
+    const playLoop = () => {
+      if (!this.bgmPlaying || this.currentBgm !== 'menu') return;
+      
+      const t = this.ctx.currentTime;
+      const bpm = 90;
+      const beatLen = 60 / bpm;
+      
+      // 和弦进行: Am - F - C - G
+      const chords = [
+        [220, 261.63, 329.63],  // Am
+        [174.61, 220, 261.63],  // F
+        [261.63, 329.63, 392],  // C
+        [196, 246.94, 293.66],  // G
+      ];
+      
+      chords.forEach((chord, i) => {
+        chord.forEach(freq => {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'triangle';
+          osc.frequency.value = freq;
+          
+          const startTime = t + i * beatLen * 2;
+          gain.gain.setValueAtTime(0, startTime);
+          gain.gain.linearRampToValueAtTime(0.08, startTime + 0.1);
+          gain.gain.linearRampToValueAtTime(0.06, startTime + beatLen * 1.5);
+          gain.gain.linearRampToValueAtTime(0, startTime + beatLen * 2);
+          
+          osc.connect(gain);
+          gain.connect(this.bgmGain);
+          osc.start(startTime);
+          osc.stop(startTime + beatLen * 2);
+        });
+      });
+      
+      // 低音
+      const bassNotes = [110, 87.31, 130.81, 98];
+      bassNotes.forEach((freq, i) => {
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        
+        const startTime = t + i * beatLen * 2;
+        gain.gain.setValueAtTime(0, startTime);
+        gain.gain.linearRampToValueAtTime(0.15, startTime + 0.05);
+        gain.gain.exponentialRampToValueAtTime(0.01, startTime + beatLen * 1.8);
+        
+        osc.connect(gain);
+        gain.connect(this.bgmGain);
+        osc.start(startTime);
+        osc.stop(startTime + beatLen * 2);
+      });
+      
+      // 循环
+      setTimeout(playLoop, beatLen * 8 * 1000 - 100);
+    };
+    
+    playLoop();
+  }
+
+  // 播放战斗BGM - 紧张激烈
+  playBattleBgm() {
+    if (!this.ctx || this.currentBgm === 'battle') return;
+    this.stopBgm();
+    this.currentBgm = 'battle';
+    this.bgmPlaying = true;
+    
+    const playLoop = () => {
+      if (!this.bgmPlaying || this.currentBgm !== 'battle') return;
+      
+      const t = this.ctx.currentTime;
+      const bpm = 140;
+      const beatLen = 60 / bpm;
+      
+      // 紧张的和弦: Em - Am - B7 - Em
+      const chords = [
+        [164.81, 196, 246.94],   // Em
+        [220, 261.63, 329.63],   // Am
+        [246.94, 293.66, 369.99, 440], // B7
+        [164.81, 196, 246.94],   // Em
+      ];
+      
+      chords.forEach((chord, i) => {
+        chord.forEach(freq => {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.value = freq;
+          
+          const filter = this.ctx.createBiquadFilter();
+          filter.type = 'lowpass';
+          filter.frequency.value = 800;
+          
+          const startTime = t + i * beatLen;
+          gain.gain.setValueAtTime(0, startTime);
+          gain.gain.linearRampToValueAtTime(0.04, startTime + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.01, startTime + beatLen * 0.9);
+          
+          osc.connect(filter);
+          filter.connect(gain);
+          gain.connect(this.bgmGain);
+          osc.start(startTime);
+          osc.stop(startTime + beatLen);
+        });
+      });
+      
+      // 鼓点节奏
+      for (let i = 0; i < 4; i++) {
+        // 底鼓
+        const kickOsc = this.ctx.createOscillator();
+        const kickGain = this.ctx.createGain();
+        kickOsc.type = 'sine';
+        kickOsc.frequency.setValueAtTime(150, t + i * beatLen);
+        kickOsc.frequency.exponentialRampToValueAtTime(50, t + i * beatLen + 0.1);
+        kickGain.gain.setValueAtTime(0.3, t + i * beatLen);
+        kickGain.gain.exponentialRampToValueAtTime(0.01, t + i * beatLen + 0.15);
+        kickOsc.connect(kickGain);
+        kickGain.connect(this.bgmGain);
+        kickOsc.start(t + i * beatLen);
+        kickOsc.stop(t + i * beatLen + 0.15);
+        
+        // 军鼓（噪声）
+        if (i === 1 || i === 3) {
+          const noise = this.ctx.createBufferSource();
+          noise.buffer = this.createNoiseBuffer(0.1);
+          const noiseGain = this.ctx.createGain();
+          const noiseFilter = this.ctx.createBiquadFilter();
+          noiseFilter.type = 'highpass';
+          noiseFilter.frequency.value = 1000;
+          noiseGain.gain.setValueAtTime(0.15, t + i * beatLen);
+          noiseGain.gain.exponentialRampToValueAtTime(0.01, t + i * beatLen + 0.08);
+          noise.connect(noiseFilter);
+          noiseFilter.connect(noiseGain);
+          noiseGain.connect(this.bgmGain);
+          noise.start(t + i * beatLen);
+          noise.stop(t + i * beatLen + 0.1);
+        }
+      }
+      
+      // 低音线
+      const bassNotes = [82.41, 110, 123.47, 82.41];
+      bassNotes.forEach((freq, i) => {
+        for (let j = 0; j < 2; j++) {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'square';
+          osc.frequency.value = freq;
+          
+          const startTime = t + i * beatLen + j * beatLen * 0.5;
+          gain.gain.setValueAtTime(0, startTime);
+          gain.gain.linearRampToValueAtTime(0.12, startTime + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.01, startTime + beatLen * 0.4);
+          
+          osc.connect(gain);
+          gain.connect(this.bgmGain);
+          osc.start(startTime);
+          osc.stop(startTime + beatLen * 0.5);
+        }
+      });
+      
+      // 循环
+      setTimeout(playLoop, beatLen * 4 * 1000 - 100);
+    };
+    
+    playLoop();
+  }
+
+  // 切换静音
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.muted) {
+      this.stopBgm();
+    } else if (gameState === 'fight') {
+      this.playBattleBgm();
+    } else if (gameState === 'title' || gameState === 'modeSelect' || gameState === 'select') {
+      this.playMenuBgm();
+    }
+    return this.muted;
+  }
+}
+
+// 全局音效实例
+const sound = new SoundSystem();
+
+// 首次用户交互时初始化音效
+let audioInitialized = false;
+function ensureAudioInit() {
+  if (!audioInitialized) {
+    sound.init();
+    audioInitialized = true;
+  }
+  sound.resume();
+}
+
+document.addEventListener('click', ensureAudioInit, { once: false });
+document.addEventListener('keydown', ensureAudioInit, { once: false });
+
+// 游戏模式
+const GAME_MODE = { LOCAL: 'local', VS_AI: 'vs_ai', ONLINE: 'online' };
+
+// 全局状态
+let gameState = 'title';
+let gameMode = GAME_MODE.LOCAL;
+let roundNum = 1, maxRounds = 3;
+let p1Wins = 0, p2Wins = 0;
+let roundTimer = 99, timerCounter = 0, koTimer = 0;
+let shakeX = 0, shakeY = 0, shakeTimer = 0, slowMotion = 0;
+let particles = [], hitSparks = [], gameFrame = 0;
+let modeCursor = 0;
+
+const MODES = [
+  { id: GAME_MODE.LOCAL, name: '本地双人', desc: '两人共用键盘对战', icon: '👥' },
+  { id: GAME_MODE.VS_AI, name: '人机对战', desc: '挑战AI电脑对手', icon: '🤖' },
+  { id: GAME_MODE.ONLINE, name: '在线对战', desc: '联网与远方朋友对战', icon: '🌐' },
+];
+
+// 在线状态
+let onlineState = {
+  phase: 'idle', ws: null, playerId: null, roomId: null, playerIndex: -1,
+  opponentInputs: new Map(), ping: 0, roomCode: '', roomCodeCursor: 0,
+  showRoomCode: false, message: '', messageTimer: 0, availableRooms: [],
+};
+
+// AI状态
+let aiState = { difficulty: 1, reactionDelay: 15, decisionTimer: 0 };
+let aiController = null;
+
+// 角色定义
+const CHARACTERS = [
+  { name: '龙 RYU', color: '#ffffff', color2: '#ff4444', speed: 4.5, jumpPower: 14, hp: 1000, punchDmg: 25, kickDmg: 35, specialDmg: 80, specialName: '波动拳', specialColor: '#44aaff', specialType: 'projectile' },
+  { name: '炎 KEN', color: '#ff3333', color2: '#ffaa00', speed: 5, jumpPower: 13, hp: 950, punchDmg: 28, kickDmg: 38, specialDmg: 90, specialName: '升龙拳', specialColor: '#ff6600', specialType: 'uppercut' },
+  { name: '雷 LEI', color: '#8844ff', color2: '#ffdd00', speed: 5.5, jumpPower: 15, hp: 900, punchDmg: 22, kickDmg: 32, specialDmg: 70, specialName: '雷光拳', specialColor: '#aa44ff', specialType: 'dash' },
+  { name: '铁 TETSU', color: '#666688', color2: '#aaaacc', speed: 3.5, jumpPower: 12, hp: 1200, punchDmg: 32, kickDmg: 45, specialDmg: 100, specialName: '铁山靠', specialColor: '#8888aa', specialType: 'charge' }
+];
+
+let p1CharIdx = 0, p2CharIdx = 1, selectCursor = 0;
+let p1Confirmed = false, p2Confirmed = false;
+
+// 输入系统
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  keys[e.code] = true;
+  if (e.key === 'Enter') handleEnter();
+  if (e.key === 'Escape') handleEscape();
+  if (e.key === 'm' || e.key === 'M') { 
+    const muted = sound.toggleMute(); 
+    sound.playMenuSelect();
+  }
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+  keys[e.code] = false;
+  e.preventDefault();
+});
+
+function handleEnter() {
+  switch (gameState) {
+    case 'title': gameState = 'modeSelect'; modeCursor = 0; sound.playMenuConfirm(); sound.playMenuBgm(); break;
+    case 'modeSelect': selectMode(); break;
+    case 'connect': handleConnectEnter(); break;
+    case 'victory':
+      gameState = 'title'; p1Wins = 0; p2Wins = 0; roundNum = 1; cleanupOnline(); sound.stopBgm(); sound.playMenuBgm(); break;
+  }
+}
+
+function handleEscape() {
+  switch (gameState) {
+    case 'modeSelect': gameState = 'title'; break;
+    case 'select':
+      if (gameMode === GAME_MODE.ONLINE) cleanupOnline();
+      gameState = 'modeSelect'; p1Confirmed = false; p2Confirmed = false; break;
+    case 'connect':
+      cleanupOnline(); gameState = 'modeSelect'; break;
+    case 'fight':
+      if (gameMode === GAME_MODE.ONLINE) cleanupOnline();
+      gameState = 'modeSelect'; p1Wins = 0; p2Wins = 0; roundNum = 1; break;
+  }
+}
+
+function selectMode() {
+  gameMode = MODES[modeCursor].id;
+  p1Confirmed = false; p2Confirmed = false; selectCursor = 0;
+  sound.playMenuConfirm();
+  if (gameMode === GAME_MODE.LOCAL || gameMode === GAME_MODE.VS_AI) gameState = 'select';
+  else if (gameMode === GAME_MODE.ONLINE) { gameState = 'connect'; onlineState.phase = 'idle'; onlineState.showRoomCode = false; onlineState.roomCode = ''; }
+}
+
+// AI控制器
+class AIController {
+  constructor(difficulty = 1) {
+    this.difficulty = difficulty;
+    this.inputs = { moveLeft: false, moveRight: false, jump: false, crouch: false, punch: false, kick: false, special: false, block: false };
+    this.decisionTimer = 0;
+    this.reactionDelay = [25, 15, 6][difficulty];
+    this.aggressiveness = [0.3, 0.5, 0.7][difficulty];
+    this.blockRate = [0.2, 0.4, 0.7][difficulty];
+    this.comboRate = [0.1, 0.3, 0.6][difficulty];
+  }
+  
+  getInputs(fighter, opponent) {
+    this.inputs = { moveLeft: false, moveRight: false, jump: false, crouch: false, punch: false, kick: false, special: false, block: false };
+    this.decisionTimer++;
+    if (this.decisionTimer < this.reactionDelay) return this.inputs;
+    this.decisionTimer = 0;
+    if (fighter.state === 'hit' || fighter.state === 'ko' || fighter.hitStun > 0) return this.inputs;
+    if (fighter.state === 'punch' || fighter.state === 'kick') {
+      if (Math.random() < this.comboRate && fighter.stateTimer < 5) {
+        if (Math.random() < 0.5) this.inputs.kick = true; else this.inputs.punch = true;
+      }
+      return this.inputs;
+    }
+    const dist = Math.abs(fighter.x - opponent.x);
+    const facingRight = opponent.x > fighter.x;
+    if (opponent.state === 'punch' || opponent.state === 'kick' || opponent.state === 'special') {
+      if (dist < 100 && Math.random() < this.blockRate) { this.inputs.block = true; return this.inputs; }
+      if (this.difficulty >= 2 && dist < 80 && Math.random() < 0.3) { this.inputs.jump = true; return this.inputs; }
+    }
+    for (let p of opponent.projectiles) {
+      if (Math.abs(p.x - fighter.x) < 200 && Math.random() < 0.5 + this.difficulty * 0.2) { this.inputs.jump = true; return this.inputs; }
+    }
+    if (dist < 70) {
+      const rand = Math.random();
+      if (rand < this.aggressiveness * 0.3) this.inputs.punch = true;
+      else if (rand < this.aggressiveness * 0.5) this.inputs.kick = true;
+      else if (rand < this.aggressiveness * 0.6 && fighter.specialMeter >= 50) this.inputs.special = true;
+    } else if (dist < 200) {
+      if (Math.random() < this.aggressiveness * 0.6) { this.inputs.moveRight = facingRight; this.inputs.moveLeft = !facingRight; }
+      else if (Math.random() < 0.5 && fighter.specialMeter >= 50) this.inputs.special = true;
+      else if (Math.random() < 0.6) { this.inputs.jump = true; this.inputs.moveRight = facingRight; this.inputs.moveLeft = !facingRight; }
+    } else {
+      this.inputs.moveRight = facingRight; this.inputs.moveLeft = !facingRight;
+      if (Math.random() < 0.15) this.inputs.jump = true;
+    }
+    return this.inputs;
+  }
+}
+
+// 网络客户端
+class NetworkClient {
+  constructor() { this.ws = null; this.connected = false; this.playerId = null; this.roomId = null; this.playerIndex = -1; this.opponentInputs = new Map(); this.ping = 0; this.message = ''; this.messageTimer = 0; }
+  
+  connect(url) {
+    return new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(url);
+        const timeout = setTimeout(() => { this.ws?.close(); reject(new Error('连接超时')); }, 10000);
+        this.ws.onopen = () => { clearTimeout(timeout); this.connected = true; resolve(); };
+        this.ws.onmessage = (event) => { try { this.handleMessage(JSON.parse(event.data)); } catch(e) {} };
+        this.ws.onclose = () => { this.connected = false; onlineState.phase = 'disconnected'; };
+        this.ws.onerror = () => { clearTimeout(timeout); this.connected = false; reject(new Error('连接失败')); };
+      } catch(e) { reject(e); }
+    });
+  }
+  
+  send(type, data = {}) { if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type, ...data })); }
+  
+  handleMessage(msg) {
+    switch(msg.type) {
+      case 'welcome': this.playerId = msg.playerId; onlineState.playerId = msg.playerId; break;
+      case 'room_created': this.roomId = msg.roomId; this.playerIndex = msg.playerIndex; onlineState.roomId = msg.roomId; onlineState.playerIndex = msg.playerIndex; onlineState.phase = 'waiting'; this.showMessage(`房间 ${msg.roomId} 已创建！`); break;
+      case 'room_joined': this.roomId = msg.roomId; this.playerIndex = msg.playerIndex; onlineState.roomId = msg.roomId; onlineState.playerIndex = msg.playerIndex; onlineState.phase = 'lobby'; this.showMessage('已加入房间！'); break;
+      case 'player_joined': onlineState.phase = 'lobby'; this.showMessage('对手已加入！'); break;
+      case 'player_left': this.showMessage('对手已离开'); if (gameState === 'fight') setTimeout(() => { gameState = 'modeSelect'; cleanupOnline(); }, 2000); break;
+      case 'game_start': onlineState.phase = 'playing'; p1CharIdx = msg.p1CharIdx; p2CharIdx = msg.p2CharIdx; this.showMessage('游戏开始！'); initRound(); break;
+      case 'opponent_input': this.opponentInputs.set(msg.frame, msg.input); for (const [f] of this.opponentInputs) if (f < gameFrame - 10) this.opponentInputs.delete(f); break;
+      case 'error': this.showMessage(msg.message || '错误'); break;
+    }
+  }
+  
+  createRoom(charIdx) { this.send('create_room', { charIdx }); }
+  joinRoom(roomId, charIdx) { this.send('join_room', { roomId: roomId.toUpperCase(), charIdx }); }
+  sendInput(input, frame) { this.send('game_input', { input, frame, timestamp: Date.now() }); }
+  sendReady(charIdx) { this.send('ready', { charIdx }); }
+  leaveRoom() { this.send('leave_room'); this.roomId = null; this.playerIndex = -1; onlineState.roomId = null; onlineState.playerIndex = -1; }
+  showMessage(msg) { this.message = msg; this.messageTimer = 180; onlineState.message = msg; onlineState.messageTimer = 180; }
+  disconnect() { if (this.ws) { this.leaveRoom(); this.ws.close(); this.ws = null; } this.connected = false; }
+  getRemoteInput(frame) { const t = frame - 2; if (this.opponentInputs.has(t)) return this.opponentInputs.get(t); let closest = null, min = Infinity; for (const [f, i] of this.opponentInputs) { const d = Math.abs(f - t); if (d < min) { min = d; closest = i; } } return closest || {}; }
+}
+
+let netClient = new NetworkClient();
+
+function cleanupOnline() {
+  if (netClient) netClient.disconnect();
+  netClient = new NetworkClient();
+  onlineState = { phase: 'idle', ws: null, playerId: null, roomId: null, playerIndex: -1, opponentInputs: new Map(), ping: 0, roomCode: '', roomCodeCursor: 0, showRoomCode: false, message: '', messageTimer: 0, availableRooms: [] };
+  updateNetworkStatus('');
+}
+
+function updateNetworkStatus(s) {
+  const el = document.getElementById('network-status');
+  if (!s) { el.style.display = 'none'; return; }
+  el.style.display = 'block'; el.className = '';
+  if (s === 'connected') { el.classList.add('status-connected'); el.textContent = '● 已连接'; }
+  else if (s === 'connecting') { el.classList.add('status-connecting'); el.textContent = '◌ 连接中...'; }
+  else { el.classList.add('status-disconnected'); el.textContent = '○ 未连接'; }
+}
+
+function handleConnectEnter() {
+  if (!onlineState.showRoomCode) { if (onlineState.phase === 'idle') connectToServer(); }
+  else if (onlineState.roomCode.length === 6 && netClient.connected) netClient.joinRoom(onlineState.roomCode, p1CharIdx);
+}
+
+async function connectToServer() {
+  updateNetworkStatus('connecting'); onlineState.phase = 'connecting';
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    await netClient.connect(`${proto}//${location.host}`);
+    updateNetworkStatus('connected'); onlineState.phase = 'idle'; onlineState.showRoomCode = true;
+    netClient.showMessage('已连接！按 1 创建房间，按 2 输入房间号');
+  } catch(e) { updateNetworkStatus('disconnected'); onlineState.phase = 'idle'; onlineState.message = '连接失败: ' + e.message; onlineState.messageTimer = 180; }
+}
+
+// 连接界面键盘
+document.addEventListener('keydown', e => {
+  if (gameState !== 'connect') return;
+  if (!onlineState.showRoomCode) {
+    if (e.key === '1' && netClient.connected) { netClient.createRoom(p1CharIdx); onlineState.showRoomCode = true; }
+    if (e.key === '2' && netClient.connected) { onlineState.showRoomCode = true; onlineState.roomCode = ''; }
+  } else {
+    if (netClient.roomId) { if (e.key === 'Enter' && onlineState.phase === 'waiting') { gameState = 'select'; p1Confirmed = false; p2Confirmed = false; } return; }
+    if (onlineState.phase === 'idle' && !netClient.roomId) {
+      if ((e.key >= '0' && e.key <= '9') || (e.key >= 'a' && e.key <= 'z') || (e.key >= 'A' && e.key <= 'Z')) { if (onlineState.roomCode.length < 6) onlineState.roomCode += e.key.toUpperCase(); }
+      if (e.key === 'Backspace') onlineState.roomCode = onlineState.roomCode.slice(0, -1);
+      if (e.key === 'Enter' && onlineState.roomCode.length === 6) netClient.joinRoom(onlineState.roomCode, p1CharIdx);
+    }
+    if ((onlineState.phase === 'waiting' || onlineState.phase === 'lobby') && e.key === 'Enter') netClient.sendReady(p1CharIdx);
+  }
+});
+
+// Fighter类
+class Fighter {
+  constructor(x, facing, charDef, isP1) {
+    this.x = x; this.y = GROUND; this.vx = 0; this.vy = 0; this.facing = facing; this.char = charDef; this.isP1 = isP1;
+    this.hp = charDef.hp; this.maxHp = charDef.hp; this.state = 'idle'; this.stateTimer = 0; this.animFrame = 0; this.animTimer = 0;
+    this.isGrounded = true; this.isBlocking = false; this.isCrouching = false; this.comboCount = 0; this.comboTimer = 0;
+    this.specialMeter = 0; this.maxSpecial = 100; this.hitStun = 0; this.blockStun = 0; this.invincible = 0;
+    this.width = 50; this.height = 100; this.projectiles = []; this.flashTimer = 0; this.hasHitThisAttack = false; this.bodyBob = 0; this.remoteControlled = false;
+  }
+
+  reset(x) {
+    this.x = x; this.y = GROUND; this.vx = 0; this.vy = 0; this.hp = this.maxHp; this.state = 'idle'; this.stateTimer = 0;
+    this.isGrounded = true; this.isBlocking = false; this.isCrouching = false; this.comboCount = 0; this.comboTimer = 0;
+    this.specialMeter = 0; this.hitStun = 0; this.blockStun = 0; this.invincible = 0; this.projectiles = []; this.flashTimer = 0; this.hasHitThisAttack = false;
+  }
+
+  getHitbox() { let h = this.isCrouching ? 60 : 100; let yOff = this.isCrouching ? 40 : 0; return { x: this.x - 25, y: this.y - h + yOff, w: 50, h: h }; }
+
+  getAttackBox() {
+    if (this.state !== 'punch' && this.state !== 'kick' && this.state !== 'special') return null;
+    let aS = 4, aE = 12; if (this.state === 'special') { aS = 6; aE = 16; }
+    let dur = this.state === 'punch' ? 18 : this.state === 'kick' ? 22 : 30;
+    if (this.stateTimer < dur - aE || this.stateTimer > dur - aS) return null;
+    let range = this.state === 'kick' ? 65 : (this.state === 'special' ? 70 : 55);
+    let h = this.state === 'kick' ? 30 : 25; let yOff = this.isCrouching ? -30 : -60;
+    return { x: this.facing === 1 ? this.x + 20 : this.x - 20 - range, y: this.y + yOff, w: range, h: h };
+  }
+
+  getInput(opponent) {
+    if (this.remoteControlled) return netClient.getRemoteInput(gameFrame);
+    if (gameMode === GAME_MODE.VS_AI && !this.isP1) { if (!aiController) aiController = new AIController(aiState.difficulty); return aiController.getInputs(this, opponent); }
+    let input = {};
+    if (this.isP1) { input.moveLeft = keys['a']; input.moveRight = keys['d']; input.jump = keys['w']; input.crouch = keys['s']; input.punch = keys['j']; input.kick = keys['k']; input.special = keys['l']; input.block = keys['u']; }
+    else { input.moveLeft = keys['arrowleft']; input.moveRight = keys['arrowright']; input.jump = keys['arrowup']; input.crouch = keys['arrowdown']; input.punch = keys['1']; input.kick = keys['2']; input.special = keys['3']; input.block = keys['0']; }
+    return input;
+  }
+
+  update(opponent) {
+    if (this.state === 'ko') { if (!this.isGrounded) { this.vy += GRAVITY; this.x += this.vx; this.y += this.vy; if (this.y >= GROUND) { this.y = GROUND; this.vy = 0; this.vx = 0; this.isGrounded = true; } } return; }
+    if (this.hitStun > 0) this.hitStun--; if (this.blockStun > 0) this.blockStun--; if (this.invincible > 0) this.invincible--; if (this.flashTimer > 0) this.flashTimer--;
+    if (this.comboTimer > 0) { this.comboTimer--; if (this.comboTimer <= 0) this.comboCount = 0; }
+    if (this.stateTimer > 0) { this.stateTimer--; if (this.stateTimer <= 0 && (this.state === 'punch' || this.state === 'kick' || this.state === 'special' || this.state === 'hit')) { this.state = 'idle'; this.hasHitThisAttack = false; } }
+    if (this.state !== 'hit' && this.hitStun <= 0) this.facing = opponent.x > this.x ? 1 : -1;
+    if (this.hitStun <= 0 && this.blockStun <= 0 && this.state !== 'punch' && this.state !== 'kick' && this.state !== 'special') {
+      const input = this.getInput(opponent);
+      this.isBlocking = input.block && this.isGrounded; this.isCrouching = input.crouch && this.isGrounded;
+      if (this.isBlocking) { this.state = 'block'; this.vx = 0; }
+      else if (input.special && this.specialMeter >= 50 && this.isGrounded) { this.state = 'special'; this.stateTimer = 30; this.specialMeter -= 50; this.hasHitThisAttack = false; this.performSpecial(); }
+      else if (input.punch && this.isGrounded) { this.state = 'punch'; this.stateTimer = 18; this.vx = 0; this.hasHitThisAttack = false; }
+      else if (input.kick && this.isGrounded) { this.state = 'kick'; this.stateTimer = 22; this.vx = 0; this.hasHitThisAttack = false; }
+      else if (input.jump && this.isGrounded) { this.vy = -this.char.jumpPower; this.isGrounded = false; this.state = 'jump'; if (input.moveLeft) this.vx = -this.char.speed; else if (input.moveRight) this.vx = this.char.speed; sound.playJump(); }
+      else if (input.moveLeft) { this.vx = -this.char.speed; if (this.isGrounded) this.state = 'walk'; }
+      else if (input.moveRight) { this.vx = this.char.speed; if (this.isGrounded) this.state = 'walk'; }
+      else { this.vx = 0; if (this.isGrounded && this.state !== 'punch' && this.state !== 'kick') this.state = 'idle'; }
+    }
+    if (this.state === 'special' && this.char.specialType === 'dash') this.vx *= 0.95;
+    if (this.state === 'special' && this.char.specialType === 'charge') this.vx *= 0.97;
+    if (!this.isGrounded) this.vy += GRAVITY;
+    this.x += this.vx; this.y += this.vy;
+    if (this.y >= GROUND) { this.y = GROUND; this.vy = 0; if (!this.isGrounded) { this.isGrounded = true; if (this.state === 'jump') this.state = 'idle'; } }
+    if (this.x < 40) this.x = 40; if (this.x > W - 40) this.x = W - 40;
+    let dist = Math.abs(this.x - opponent.x);
+    if (dist < 50 && this.isGrounded && opponent.isGrounded) { let push = (50 - dist) / 2; if (this.x < opponent.x) { this.x -= push; opponent.x += push; } else { this.x += push; opponent.x -= push; } }
+    this.animTimer++; if (this.animTimer > 8) { this.animTimer = 0; this.animFrame = (this.animFrame + 1) % 4; }
+    this.bodyBob = Math.sin(Date.now() / 200) * 2;
+    for (let i = this.projectiles.length - 1; i >= 0; i--) { let p = this.projectiles[i]; p.x += p.vx; p.life--; if (p.life <= 0 || p.x < 0 || p.x > W) this.projectiles.splice(i, 1); }
+    if (this.specialMeter < this.maxSpecial) this.specialMeter += 0.05;
+  }
+
+  performSpecial() {
+    let type = this.char.specialType;
+    sound.playSpecial();
+    if (type === 'projectile') { this.projectiles.push({ x: this.x + this.facing * 40, y: this.y - 55, vx: this.facing * 8, size: 20, life: 60, dmg: this.char.specialDmg, color: this.char.specialColor }); sound.playProjectile(); }
+    else if (type === 'uppercut') { this.vy = -14; this.isGrounded = false; this.vx = this.facing * 3; }
+    else if (type === 'dash') { this.vx = this.facing * 14; this.invincible = 10; }
+    else if (type === 'charge') { this.vx = this.facing * 8; this.invincible = 15; }
+    shakeTimer = 8; addParticle(this.x + this.facing * 30, this.y - 50, this.char.specialColor, 15);
+  }
+
+  takeHit(dmg, attacker) {
+    if (this.invincible > 0) return;
+    if (this.isBlocking) { 
+      dmg = Math.floor(dmg * 0.1); 
+      this.blockStun = 10; 
+      this.vx = -this.facing * 3; 
+      addSpark(this.x + this.facing * -20, this.y - 50, '#88aaff'); 
+      sound.playBlock();
+    }
+    else { 
+      this.state = 'hit'; 
+      this.stateTimer = 15; 
+      this.hitStun = 15; 
+      this.vx = -this.facing * 5; 
+      if (!this.isGrounded) this.vy = -3; 
+      this.flashTimer = 10; 
+      attacker.comboCount++; 
+      attacker.comboTimer = 60; 
+      attacker.specialMeter = Math.min(attacker.maxSpecial, attacker.specialMeter + 8); 
+      addSpark(this.x + this.facing * -20, this.y - 50, '#ffaa00'); 
+      shakeTimer = 5; 
+      // 根据攻击者状态播放不同音效
+      if (attacker.state === 'punch') sound.playPunchHit();
+      else if (attacker.state === 'kick') sound.playKickHit();
+      else sound.playKickHit(); // special uses heavier sound
+      if (attacker.comboCount > 1) dmg = Math.floor(dmg * (1 + attacker.comboCount * 0.1)); 
+    }
+    this.hp -= dmg;
+    if (this.hp <= 0) { 
+      this.hp = 0; 
+      this.state = 'ko'; 
+      this.vy = -8; 
+      this.vx = -this.facing * 4; 
+      this.isGrounded = false; 
+      shakeTimer = 20; 
+      slowMotion = 30; 
+      sound.playKO();
+    }
+  }
+
+  draw() {
+    ctx.save();
+    if (this.flashTimer > 0 && this.flashTimer % 4 < 2) ctx.globalAlpha = 0.5;
+    if (this.invincible > 0) ctx.globalAlpha = 0.6 + Math.sin(Date.now() / 50) * 0.3;
+    let f = this.facing, bob = this.state === 'idle' ? this.bodyBob : 0, crouchOff = this.isCrouching ? 30 : 0;
+    ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.beginPath(); ctx.ellipse(this.x, GROUND + 5, 30, 8, 0, 0, Math.PI * 2); ctx.fill();
+    let bodyY = this.y - 50 + bob + crouchOff;
+    if (this.state === 'ko') { ctx.save(); ctx.translate(this.x, this.y - 20); ctx.rotate(f * Math.PI / 2); this.drawBodyAt(0, 0, f); ctx.restore(); }
+    else if (this.state === 'hit') { ctx.save(); ctx.translate(this.x, bodyY); ctx.rotate(-f * 0.2); this.drawBodyAt(0, 0, f); ctx.restore(); }
+    else if (this.state === 'block') this.drawBlocking(this.x, bodyY, f);
+    else if (this.state === 'punch') this.drawPunch(this.x, bodyY, f);
+    else if (this.state === 'kick') this.drawKick(this.x, bodyY, f);
+    else if (this.state === 'special') this.drawSpecialPose(this.x, bodyY, f);
+    else this.drawBodyAt(this.x, bodyY, f);
+    for (let p of this.projectiles) {
+      ctx.save(); ctx.translate(p.x, p.y); let pulse = Math.sin(Date.now() / 50) * 3;
+      let grad = ctx.createRadialGradient(0, 0, 0, 0, 0, p.size + pulse + 10);
+      grad.addColorStop(0, p.color); grad.addColorStop(0.5, p.color + '88'); grad.addColorStop(1, 'transparent');
+      ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(0, 0, p.size + pulse + 10, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(0, 0, p.size * 0.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(0, 0, p.size + pulse, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  drawHead(x, y, f) {
+    let c = this.char;
+    ctx.fillStyle = '#ffcc88'; ctx.fillRect(x - 12, y - 42, 24, 24);
+    ctx.fillStyle = c.color === '#ffffff' ? '#442200' : c.color; ctx.fillRect(x - 14, y - 48, 28, 12);
+    if (c.specialType === 'uppercut') { ctx.fillRect(x - 10, y - 55, 6, 10); ctx.fillRect(x, y - 58, 6, 12); ctx.fillRect(x + 8, y - 53, 6, 8); }
+    ctx.fillStyle = '#000'; ctx.fillRect(x - 6 + f * 2, y - 36, 4, 4); ctx.fillRect(x + 4 + f * 2, y - 36, 4, 4);
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 14, y - 40, 28, 4);
+    if (f === 1) { ctx.fillRect(x - 18, y - 42, 6, 3); ctx.fillRect(x - 22, y - 40, 6, 3); } else { ctx.fillRect(x + 12, y - 42, 6, 3); ctx.fillRect(x + 16, y - 40, 6, 3); }
+  }
+
+  drawBodyAt(x, y, f) {
+    let c = this.char, ls = this.state === 'walk' ? Math.sin(this.animTimer * 0.5 + this.animFrame) * 10 : 5;
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 12, y + 20, 10, 35 - (this.isCrouching ? 15 : 0)); ctx.fillRect(x + 2, y + 20, 10, 35 - (this.isCrouching ? 15 : 0));
+    ctx.fillStyle = '#333'; ctx.fillRect(x - 15 + (this.state === 'walk' ? ls : 0), y + 50 - (this.isCrouching ? 15 : 0), 14, 8); ctx.fillRect(x + 1 - (this.state === 'walk' ? ls : 0), y + 50 - (this.isCrouching ? 15 : 0), 14, 8);
+    ctx.fillStyle = c.color; ctx.fillRect(x - 18, y - 20, 36, 42);
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 18, y + 15, 36, 6);
+    let ab = Math.sin(Date.now() / 300) * 3;
+    ctx.fillStyle = c.color; ctx.fillRect(x - 25, y - 15 + ab, 10, 30); ctx.fillRect(x + 15, y - 15 - ab, 10, 30);
+    ctx.fillStyle = '#ffcc88'; ctx.fillRect(x - 26, y + 12 + ab, 10, 10); ctx.fillRect(x + 16, y + 12 - ab, 10, 10);
+    this.drawHead(x, y, f);
+  }
+
+  drawPunch(x, y, f) {
+    let c = this.char, ext = this.stateTimer > 10 ? (18 - this.stateTimer) * 5 : this.stateTimer * 3;
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 12, y + 20, 10, 35); ctx.fillRect(x + 2, y + 20, 10, 35);
+    ctx.fillStyle = '#333'; ctx.fillRect(x - 15, y + 50, 14, 8); ctx.fillRect(x + 1, y + 50, 14, 8);
+    ctx.save(); ctx.translate(x, y); ctx.rotate(f * 0.1); ctx.fillStyle = c.color; ctx.fillRect(-18, -20, 36, 42); ctx.fillStyle = c.color2; ctx.fillRect(-18, 15, 36, 6); ctx.restore();
+    ctx.fillStyle = c.color; ctx.fillRect(x + f * 15, y - 15, f * (20 + ext), 12);
+    ctx.fillStyle = '#ffcc88'; ctx.fillRect(x + f * (35 + ext), y - 17, 14, 14);
+    if (this.stateTimer > 8 && this.stateTimer < 14) { ctx.fillStyle = '#ffffff88'; ctx.beginPath(); ctx.arc(x + f * (50 + ext), y - 10, 8, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = c.color; ctx.fillRect(x - f * 20, y - 10, 10, 25); this.drawHead(x, y, f);
+  }
+
+  drawKick(x, y, f) {
+    let c = this.char, ext = this.stateTimer > 12 ? (22 - this.stateTimer) * 4 : this.stateTimer * 3;
+    ctx.fillStyle = c.color2; ctx.fillRect(x - f * 5 - 5, y + 20, 10, 35);
+    ctx.fillStyle = '#333'; ctx.fillRect(x - f * 5 - 8, y + 50, 14, 8);
+    ctx.fillStyle = c.color2; ctx.save(); ctx.translate(x + f * 5, y + 25); ctx.rotate(f * -0.5); ctx.fillRect(0, -5, f * (25 + ext), 12); ctx.fillStyle = '#333'; ctx.fillRect(f * (22 + ext), -7, 14, 14); ctx.restore();
+    ctx.fillStyle = c.color; ctx.fillRect(x - 18, y - 20, 36, 42); ctx.fillStyle = c.color2; ctx.fillRect(x - 18, y + 15, 36, 6);
+    ctx.fillStyle = c.color; ctx.fillRect(x - 25, y - 15, 10, 30); ctx.fillRect(x + 15, y - 15, 10, 30);
+    ctx.fillStyle = '#ffcc88'; ctx.fillRect(x - 26, y + 12, 10, 10); ctx.fillRect(x + 16, y + 12, 10, 10); this.drawHead(x, y, f);
+  }
+
+  drawSpecialPose(x, y, f) {
+    let c = this.char, pulse = Math.sin(this.stateTimer * 0.5) * 5;
+    ctx.save(); let ag = ctx.createRadialGradient(x, y - 30, 0, x, y - 30, 60 + pulse); ag.addColorStop(0, c.specialColor + '44'); ag.addColorStop(1, 'transparent'); ctx.fillStyle = ag; ctx.beginPath(); ctx.arc(x, y - 30, 60 + pulse, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 15, y + 15, 12, 38); ctx.fillRect(x + 3, y + 15, 12, 38);
+    ctx.fillStyle = '#333'; ctx.fillRect(x - 18, y + 48, 16, 8); ctx.fillRect(x + 2, y + 48, 16, 8);
+    ctx.fillStyle = c.color; ctx.fillRect(x - 20, y - 22, 40, 40); ctx.fillStyle = c.color2; ctx.fillRect(x - 20, y + 12, 40, 6);
+    ctx.fillStyle = c.color;
+    if (c.specialType === 'projectile') { ctx.fillRect(x + f * 10, y - 20, f * 35, 12); ctx.fillRect(x + f * 10, y - 10, f * 35, 12); ctx.fillStyle = '#ffcc88'; ctx.fillRect(x + f * 42, y - 22, 12, 12); ctx.fillRect(x + f * 42, y - 12, 12, 12); }
+    else if (c.specialType === 'uppercut') { ctx.fillRect(x + f * 10, y - 45, f * 15, 40); ctx.fillStyle = '#ffcc88'; ctx.fillRect(x + f * 12, y - 50, 14, 14); ctx.fillStyle = c.color; ctx.fillRect(x - f * 20, y - 10, 10, 25); }
+    else { ctx.fillRect(x + f * 15, y - 15, f * 25, 14); ctx.fillRect(x - f * 5, y - 15, f * 25, 14); ctx.fillStyle = '#ffcc88'; ctx.fillRect(x + f * 38, y - 17, 14, 14); }
+    ctx.fillStyle = '#ffcc88'; ctx.fillRect(x - 12, y - 44, 24, 24);
+    ctx.fillStyle = c.color === '#ffffff' ? '#442200' : c.color; ctx.fillRect(x - 14, y - 50, 28, 12);
+    ctx.fillStyle = c.specialColor; ctx.fillRect(x - 6 + f * 2, y - 38, 5, 5); ctx.fillRect(x + 4 + f * 2, y - 38, 5, 5);
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 14, y - 42, 28, 4);
+  }
+
+  drawBlocking(x, y, f) {
+    let c = this.char;
+    ctx.fillStyle = c.color2; ctx.fillRect(x - 10, y + 20, 10, 35); ctx.fillRect(x + 0, y + 20, 10, 35);
+    ctx.fillStyle = '#333'; ctx.fillRect(x - 13, y + 50, 14, 8); ctx.fillRect(x - 1, y + 50, 14, 8);
+    ctx.fillStyle = c.color; ctx.fillRect(x - 18, y - 20, 36, 42); ctx.fillStyle = c.color2; ctx.fillRect(x - 18, y + 15, 36, 6);
+    ctx.fillStyle = c.color; ctx.fillRect(x - 8, y - 18, 16, 35);
+    ctx.fillStyle = '#ffcc88'; ctx.fillRect(x - 10, y - 20, 8, 10); ctx.fillRect(x + 2, y - 20, 8, 10);
+    ctx.strokeStyle = '#88aaff88'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x + f * 10, y - 20, 35, -Math.PI * 0.6, Math.PI * 0.6); ctx.stroke();
+    this.drawHead(x, y, f);
+  }
+}
+
+let player1, player2;
+
+function initRound() {
+  player1 = new Fighter(250, 1, CHARACTERS[p1CharIdx], true);
+  player2 = new Fighter(710, -1, CHARACTERS[p2CharIdx], false);
+  if (gameMode === GAME_MODE.ONLINE) { if (onlineState.playerIndex === 0) player2.remoteControlled = true; else player1.remoteControlled = true; }
+  roundTimer = 99; timerCounter = 0; koTimer = 0; particles = []; hitSparks = []; gameState = 'fight'; gameFrame = 0;
+  sound.stopBgm();
+  sound.playRoundStart();
+  setTimeout(() => sound.playBattleBgm(), 1500);
+}
+
+function addParticle(x, y, color, count) { for (let i = 0; i < count; i++) particles.push({ x, y, vx: (Math.random() - 0.5) * 8, vy: (Math.random() - 0.5) * 8 - 3, life: 20 + Math.random() * 20, color, size: 2 + Math.random() * 4 }); }
+function addSpark(x, y, color) { hitSparks.push({ x, y, color, life: 12, maxLife: 12 }); }
+function updateParticles() { for (let i = particles.length - 1; i >= 0; i--) { let p = particles[i]; p.x += p.vx; p.y += p.vy; p.vy += 0.2; p.life--; if (p.life <= 0) particles.splice(i, 1); } for (let i = hitSparks.length - 1; i >= 0; i--) { hitSparks[i].life--; if (hitSparks[i].life <= 0) hitSparks.splice(i, 1); } }
+
+function drawParticles() {
+  for (let p of particles) { ctx.globalAlpha = p.life / 30; ctx.fillStyle = p.color; ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size); }
+  ctx.globalAlpha = 1;
+  for (let s of hitSparks) { let pr = 1 - s.life / s.maxLife; let sz = 20 + pr * 30; ctx.save(); ctx.translate(s.x, s.y); ctx.globalAlpha = s.life / s.maxLife; ctx.fillStyle = '#fff'; for (let i = 0; i < 4; i++) { ctx.save(); ctx.rotate(i * Math.PI / 4 + pr * 0.5); ctx.fillRect(-2, -sz, 4, sz * 2); ctx.restore(); } ctx.fillStyle = s.color; ctx.beginPath(); ctx.arc(0, 0, sz * 0.4, 0, Math.PI * 2); ctx.fill(); ctx.restore(); }
+}
+
+function boxOverlap(a, b) { return a && b && a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+function checkAttacks() {
+  let atk1 = player1.getAttackBox(), hb2 = player2.getHitbox();
+  if (atk1 && !player1.hasHitThisAttack && boxOverlap(atk1, hb2) && player2.hitStun <= 0 && player2.state !== 'hit') { let dmg = player1.state === 'punch' ? player1.char.punchDmg : player1.state === 'kick' ? player1.char.kickDmg : player1.char.specialDmg; player2.takeHit(dmg, player1); player1.hasHitThisAttack = true; }
+  let atk2 = player2.getAttackBox(), hb1 = player1.getHitbox();
+  if (atk2 && !player2.hasHitThisAttack && boxOverlap(atk2, hb1) && player1.hitStun <= 0 && player1.state !== 'hit') { let dmg = player2.state === 'punch' ? player2.char.punchDmg : player2.state === 'kick' ? player2.char.kickDmg : player2.char.specialDmg; player1.takeHit(dmg, player2); player2.hasHitThisAttack = true; }
+  for (let i = player1.projectiles.length - 1; i >= 0; i--) { let p = player1.projectiles[i]; let pBox = { x: p.x - p.size, y: p.y - p.size, w: p.size * 2, h: p.size * 2 }; if (boxOverlap(pBox, hb2) && player2.hitStun <= 0) { player2.takeHit(p.dmg, player1); addParticle(p.x, p.y, p.color, 10); player1.projectiles.splice(i, 1); } }
+  for (let i = player2.projectiles.length - 1; i >= 0; i--) { let p = player2.projectiles[i]; let pBox = { x: p.x - p.size, y: p.y - p.size, w: p.size * 2, h: p.size * 2 }; if (boxOverlap(pBox, hb1) && player1.hitStun <= 0) { player1.takeHit(p.dmg, player2); addParticle(p.x, p.y, p.color, 10); player2.projectiles.splice(i, 1); } }
+}
+
+function drawStage() {
+  let sg = ctx.createLinearGradient(0, 0, 0, H); sg.addColorStop(0, '#1a0a2e'); sg.addColorStop(0.5, '#2d1b4e'); sg.addColorStop(1, '#0d0d1a'); ctx.fillStyle = sg; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffeecc'; ctx.beginPath(); ctx.arc(750, 80, 40, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#1a0a2e'; ctx.beginPath(); ctx.arc(765, 75, 35, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff'; for (let i = 0; i < 30; i++) { let sx = (i * 137 + 50) % W, sy = (i * 97 + 20) % (H * 0.4); ctx.globalAlpha = (Math.sin(Date.now() / 500 + i) * 0.5 + 0.5) * 0.8; ctx.fillRect(sx, sy, 2, 2); } ctx.globalAlpha = 1;
+  ctx.fillStyle = '#0d0d2a'; for (let i = 0; i < 8; i++) { let bx = i * 130 - 20, bh = 100 + (i * 47 % 80); ctx.fillRect(bx, GROUND - bh + 60, 100, bh + 20); ctx.fillStyle = '#ffaa0033'; for (let wy = 0; wy < bh - 20; wy += 20) for (let wx = 10; wx < 90; wx += 20) if (Math.sin(i + wx + wy) > 0) ctx.fillRect(bx + wx, GROUND - bh + 70 + wy, 10, 12); ctx.fillStyle = '#0d0d2a'; }
+  ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, GROUND + 5, W, H - GROUND);
+  ctx.strokeStyle = '#333355'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, GROUND + 5); ctx.lineTo(W, GROUND + 5); ctx.stroke();
+  ctx.fillStyle = '#222244'; for (let i = 0; i < W; i += 40) ctx.fillRect(i, GROUND + 8, 20, 3);
+}
+
+function drawHUD() {
+  ctx.fillStyle = '#222'; ctx.fillRect(30, 20, 400, 28); ctx.fillRect(W - 430, 20, 400, 28);
+  let p1Pct = player1.hp / player1.maxHp, p2Pct = player2.hp / player2.maxHp;
+  let p1c = p1Pct > 0.5 ? '#44ff44' : p1Pct > 0.25 ? '#ffaa00' : '#ff3333';
+  let p2c = p2Pct > 0.5 ? '#44ff44' : p2Pct > 0.25 ? '#ffaa00' : '#ff3333';
+  ctx.fillStyle = p1c; ctx.fillRect(32, 22, 396 * p1Pct, 24);
+  ctx.fillStyle = p2c; ctx.fillRect(W - 428 + 396 * (1 - p2Pct), 22, 396 * p2Pct, 24);
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(30, 20, 400, 28); ctx.strokeRect(W - 430, 20, 400, 28);
+  ctx.fillStyle = '#333'; ctx.fillRect(30, 52, 200, 10); ctx.fillRect(W - 230, 52, 200, 10);
+  let sp1 = player1.specialMeter / player1.maxSpecial, sp2 = player2.specialMeter / player2.maxSpecial;
+  ctx.fillStyle = sp1 >= 0.5 ? '#ffdd00' : '#886600'; ctx.fillRect(31, 53, 198 * sp1, 8);
+  ctx.fillStyle = sp2 >= 0.5 ? '#ffdd00' : '#886600'; ctx.fillRect(W - 229 + 198 * (1 - sp2), 53, 198 * sp2, 8);
+  ctx.font = '8px monospace';
+  if (sp1 >= 0.5) { ctx.fillStyle = '#ffdd00'; ctx.textAlign = 'left'; ctx.fillText('★ 必杀可用', 32, 72); }
+  if (sp2 >= 0.5) { ctx.fillStyle = '#ffdd00'; ctx.textAlign = 'right'; ctx.fillText('★ 必杀可用', W - 32, 72); }
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 14px monospace'; ctx.textAlign = 'left'; ctx.fillText(player1.char.name, 35, 16);
+  ctx.textAlign = 'right'; ctx.fillText(player2.char.name, W - 35, 16);
+  if (gameMode === GAME_MODE.ONLINE) { ctx.font = '10px monospace'; ctx.fillStyle = '#4488ff'; ctx.textAlign = 'left'; ctx.fillText(onlineState.playerIndex === 0 ? '(你)' : '(对手)', 35 + ctx.measureText(player1.char.name).width + 5, 16); ctx.fillStyle = '#ff4444'; ctx.textAlign = 'right'; ctx.fillText(onlineState.playerIndex === 1 ? '(你)' : '(对手)', W - 35 - ctx.measureText(player2.char.name).width - 5, 16); }
+  if (gameMode === GAME_MODE.VS_AI) { ctx.font = '10px monospace'; ctx.fillStyle = '#44ff44'; ctx.textAlign = 'right'; ctx.fillText('(CPU)', W - 35, 16); }
+  ctx.fillStyle = '#000'; ctx.fillRect(W/2 - 30, 15, 60, 40); ctx.strokeStyle = '#ffcc00'; ctx.lineWidth = 2; ctx.strokeRect(W/2 - 30, 15, 60, 40);
+  ctx.fillStyle = roundTimer <= 10 ? '#ff3333' : '#fff'; ctx.font = 'bold 28px monospace'; ctx.textAlign = 'center'; ctx.fillText(Math.ceil(roundTimer).toString(), W/2, 46);
+  for (let i = 0; i < maxRounds; i++) { ctx.fillStyle = i < p1Wins ? '#ffcc00' : '#444'; ctx.beginPath(); ctx.arc(440 + i * 18, 35, 6, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = i < p2Wins ? '#ffcc00' : '#444'; ctx.beginPath(); ctx.arc(W - 440 - i * 18, 35, 6, 0, Math.PI * 2); ctx.fill(); }
+  if (player1.comboCount > 1) { ctx.fillStyle = '#ffaa00'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'left'; ctx.fillText(player1.comboCount + ' HITS!', 50, 100); }
+  if (player2.comboCount > 1) { ctx.fillStyle = '#ffaa00'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'right'; ctx.fillText(player2.comboCount + ' HITS!', W - 50, 100); }
+  if (gameMode === GAME_MODE.ONLINE && netClient.ping > 0) { ctx.fillStyle = netClient.ping < 100 ? '#44ff44' : netClient.ping < 200 ? '#ffaa00' : '#ff4444'; ctx.font = '10px monospace'; ctx.textAlign = 'right'; ctx.fillText(`延迟: ${netClient.ping}ms`, W - 10, H - 10); }
+  // 音效状态
+  ctx.fillStyle = sound.muted ? '#ff4444' : '#44ff44'; ctx.font = '12px monospace'; ctx.textAlign = 'right'; ctx.fillText(sound.muted ? '🔇 静音' : '🔊 音效 [M]', W - 10, H - 30);
+  ctx.textAlign = 'left';
+}
+
+function drawTitle() {
+  ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 20; i++) { let y = (Date.now() / 20 + i * 30) % H; ctx.strokeStyle = 'rgba(255,100,0,' + (0.1 + Math.sin(i) * 0.05) + ')'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  ctx.save(); let ts = 1 + Math.sin(Date.now() / 500) * 0.02; ctx.translate(W/2, 140); ctx.scale(ts, ts);
+  ctx.fillStyle = '#ff3300'; ctx.font = 'bold 72px monospace'; ctx.textAlign = 'center'; ctx.fillText('格斗之王', 3, 3);
+  let tg = ctx.createLinearGradient(-200, -40, 200, 40); tg.addColorStop(0, '#ff6600'); tg.addColorStop(0.5, '#ffcc00'); tg.addColorStop(1, '#ff6600'); ctx.fillStyle = tg; ctx.fillText('格斗之王', 0, 0); ctx.restore();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 24px monospace'; ctx.textAlign = 'center'; ctx.fillText('FIGHTING KING', W/2, 190);
+  ctx.fillStyle = '#888'; ctx.font = '14px monospace'; ctx.fillText('v2.0 Online', W/2, 220);
+  if (Math.sin(Date.now() / 400) > 0) { ctx.fillStyle = '#ffcc00'; ctx.font = '18px monospace'; ctx.fillText('— 按 ENTER 开始 —', W/2, 320); }
+  ctx.fillStyle = '#555'; ctx.font = '11px monospace'; ctx.fillText('支持: 本地双人 | 人机对战 | 在线联机', W/2, 380); ctx.textAlign = 'left';
+}
+
+function drawModeSelect() {
+  ctx.fillStyle = '#0a0a2a'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 32px monospace'; ctx.textAlign = 'center'; ctx.fillText('选择模式', W/2, 60);
+  for (let i = 0; i < MODES.length; i++) {
+    const m = MODES[i], y = 150 + i * 120, sel = modeCursor === i;
+    ctx.fillStyle = sel ? '#2a2a5a' : '#1a1a3a'; ctx.fillRect(W/2 - 250, y - 40, 500, 90);
+    ctx.strokeStyle = sel ? '#ffcc00' : '#444466'; ctx.lineWidth = sel ? 3 : 1; ctx.strokeRect(W/2 - 250, y - 40, 500, 90);
+    ctx.font = '36px monospace'; ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.fillText(m.icon, W/2 - 200, y + 15);
+    ctx.fillStyle = sel ? '#ffcc00' : '#fff'; ctx.font = 'bold 22px monospace'; ctx.textAlign = 'left'; ctx.fillText(m.name, W/2 - 140, y);
+    ctx.fillStyle = sel ? '#aaa' : '#666'; ctx.font = '13px monospace'; ctx.fillText(m.desc, W/2 - 140, y + 25);
+    if (sel) { ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 20px monospace'; ctx.textAlign = 'right'; ctx.fillText('▶', W/2 - 260, y + 10); }
+  }
+  ctx.fillStyle = '#666'; ctx.font = '12px monospace'; ctx.textAlign = 'center'; ctx.fillText('W/S 或 ↑/↓ 选择 | ENTER 确认 | ESC 返回', W/2, H - 40); ctx.textAlign = 'left';
+}
+
+function updateModeSelect() { if (keys['w'] || keys['arrowup']) { modeCursor = (modeCursor - 1 + MODES.length) % MODES.length; keys['w'] = false; keys['arrowup'] = false; sound.playMenuSelect(); } if (keys['s'] || keys['arrowdown']) { modeCursor = (modeCursor + 1) % MODES.length; keys['s'] = false; keys['arrowdown'] = false; sound.playMenuSelect(); } }
+
+function drawConnect() {
+  ctx.fillStyle = '#0a0a2a'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 28px monospace'; ctx.textAlign = 'center'; ctx.fillText('🌐 在线对战', W/2, 50);
+  const sy = 100;
+  if (!netClient.connected) {
+    ctx.fillStyle = '#888'; ctx.font = '16px monospace'; ctx.fillText('连接到服务器...', W/2, sy);
+    if (onlineState.phase === 'idle') { ctx.fillStyle = '#ffcc00'; ctx.font = '14px monospace'; const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'; ctx.fillText(`服务器: ${proto}//${location.host}`, W/2, sy + 40); if (Math.sin(Date.now() / 300) > 0) { ctx.fillStyle = '#fff'; ctx.fillText('按 ENTER 连接', W/2, sy + 80); } }
+  } else {
+    ctx.fillStyle = '#44ff44'; ctx.font = '14px monospace'; ctx.fillText('● 已连接到服务器', W/2, sy);
+    if (!netClient.roomId) {
+      if (!onlineState.showRoomCode) { ctx.fillStyle = '#fff'; ctx.font = '16px monospace'; ctx.fillText('按 1 创建新房间', W/2, sy + 50); ctx.fillText('按 2 输入房间号加入', W/2, sy + 80); }
+      else { ctx.fillStyle = '#fff'; ctx.font = '16px monospace'; ctx.fillText('输入6位房间号:', W/2, sy + 50); ctx.fillStyle = '#1a1a3a'; ctx.fillRect(W/2 - 120, sy + 65, 240, 50); ctx.strokeStyle = '#ffcc00'; ctx.lineWidth = 2; ctx.strokeRect(W/2 - 120, sy + 65, 240, 50); ctx.fillStyle = '#fff'; ctx.font = 'bold 32px monospace'; let code = onlineState.roomCode; while (code.length < 6) code += '_'; ctx.fillText(code, W/2, sy + 100); ctx.fillStyle = '#888'; ctx.font = '12px monospace'; ctx.fillText('输入完成后按 ENTER 加入', W/2, sy + 140); }
+    } else {
+      ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 20px monospace'; ctx.fillText(`房间号: ${netClient.roomId}`, W/2, sy + 50);
+      if (onlineState.phase === 'waiting') { ctx.fillStyle = '#fff'; ctx.font = '16px monospace'; ctx.fillText('等待对手加入...', W/2, sy + 90); ctx.fillStyle = '#44ff44'; ctx.font = '14px monospace'; ctx.fillText(`将房间号 "${netClient.roomId}" 发给你的朋友`, W/2, sy + 130); ctx.fillStyle = '#888'; ctx.font = '12px monospace'; ctx.fillText('对手加入后按 ENTER 选择角色', W/2, sy + 170); }
+      else if (onlineState.phase === 'lobby') { ctx.fillStyle = '#44ff44'; ctx.font = '16px monospace'; ctx.fillText('对手已就位！', W/2, sy + 90); ctx.fillText('按 ENTER 选择角色', W/2, sy + 120); }
+    }
+  }
+  if (onlineState.messageTimer > 0) { onlineState.messageTimer--; ctx.fillStyle = '#ffcc00'; ctx.font = '14px monospace'; ctx.textAlign = 'center'; ctx.fillText(onlineState.message, W/2, H - 80); }
+  ctx.fillStyle = '#555'; ctx.font = '12px monospace'; ctx.fillText('ESC 返回菜单', W/2, H - 30); ctx.textAlign = 'left';
+}
+
+function drawSelect() {
+  ctx.fillStyle = '#0a0a2a'; ctx.fillRect(0, 0, W, H);
+  let tt = '选择角色'; if (gameMode === GAME_MODE.VS_AI) tt = '选择角色 (人机对战)'; if (gameMode === GAME_MODE.ONLINE) tt = '选择角色 (在线对战)';
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 28px monospace'; ctx.textAlign = 'center'; ctx.fillText(tt, W/2, 50);
+  if (gameMode === GAME_MODE.VS_AI) { ctx.fillStyle = '#888'; ctx.font = '12px monospace'; ctx.fillText(`AI难度: ${['简单', '普通', '困难'][aiState.difficulty]} (按 Q/E 调整)`, W/2, 75); }
+  for (let i = 0; i < CHARACTERS.length; i++) {
+    let cx = 150 + i * 180, cy = gameMode === GAME_MODE.VS_AI ? 230 : 200, c = CHARACTERS[i], sel = selectCursor === i;
+    ctx.fillStyle = sel ? '#333366' : '#1a1a3a'; ctx.fillRect(cx - 60, cy - 80, 120, 200);
+    ctx.strokeStyle = sel ? '#ffcc00' : '#444466'; ctx.lineWidth = sel ? 3 : 1; ctx.strokeRect(cx - 60, cy - 80, 120, 200);
+    ctx.fillStyle = c.color; ctx.fillRect(cx - 15, cy - 40, 30, 40); ctx.fillStyle = '#ffcc88'; ctx.fillRect(cx - 10, cy - 60, 20, 20); ctx.fillStyle = c.color2; ctx.fillRect(cx - 15, cy, 12, 30); ctx.fillRect(cx + 3, cy, 12, 30);
+    ctx.fillStyle = '#fff'; ctx.font = '12px monospace'; ctx.textAlign = 'center'; ctx.fillText(c.name, cx, cy + 55);
+    ctx.font = '9px monospace'; ctx.fillStyle = '#aaa'; ctx.fillText('速度:' + '■'.repeat(Math.round(c.speed)), cx, cy + 75); ctx.fillText('力量:' + '■'.repeat(Math.round(c.punchDmg / 8)), cx, cy + 90); ctx.fillText('防御:' + '■'.repeat(Math.round(c.hp / 250)), cx, cy + 105);
+    if (p1Confirmed && p1CharIdx === i) { ctx.fillStyle = '#4488ff'; ctx.font = 'bold 14px monospace'; ctx.fillText('P1', cx - 40, cy - 65); }
+    if (p2Confirmed && p2CharIdx === i) { ctx.fillStyle = gameMode === GAME_MODE.VS_AI ? '#44ff44' : '#ff4444'; ctx.font = 'bold 14px monospace'; ctx.fillText(gameMode === GAME_MODE.VS_AI ? 'CPU' : 'P2', cx + 30, cy - 65); }
+  }
+  ctx.fillStyle = '#888'; ctx.font = '12px monospace'; ctx.textAlign = 'center';
+  if (gameMode === GAME_MODE.LOCAL) ctx.fillText('P1: A/D选择 J确认 | P2: ←/→选择 1确认', W/2, H - 50);
+  else if (gameMode === GAME_MODE.VS_AI) ctx.fillText('A/D选择 J确认 | Q/E切换难度', W/2, H - 50);
+  else ctx.fillText('A/D选择 J确认', W/2, H - 50);
+  ctx.textAlign = 'left';
+}
+
+function updateSelect() {
+  if (gameMode === GAME_MODE.VS_AI) { if (keys['q']) { aiState.difficulty = Math.max(0, aiState.difficulty - 1); keys['q'] = false; sound.playMenuSelect(); } if (keys['e']) { aiState.difficulty = Math.min(2, aiState.difficulty + 1); keys['e'] = false; sound.playMenuSelect(); } }
+  if (!p1Confirmed) {
+    if (keys['a']) { selectCursor = (selectCursor - 1 + CHARACTERS.length) % CHARACTERS.length; keys['a'] = false; sound.playMenuSelect(); }
+    if (keys['d']) { selectCursor = (selectCursor + 1) % CHARACTERS.length; keys['d'] = false; sound.playMenuSelect(); }
+    if (keys['j']) { p1CharIdx = selectCursor; p1Confirmed = true; keys['j'] = false; sound.playMenuConfirm(); if (gameMode === GAME_MODE.VS_AI) { p2CharIdx = Math.floor(Math.random() * CHARACTERS.length); p2Confirmed = true; aiController = new AIController(aiState.difficulty); setTimeout(() => initRound(), 500); } }
+  }
+  if (gameMode === GAME_MODE.LOCAL && !p2Confirmed) { if (keys['arrowleft']) { selectCursor = (selectCursor - 1 + CHARACTERS.length) % CHARACTERS.length; keys['arrowleft'] = false; sound.playMenuSelect(); } if (keys['arrowright']) { selectCursor = (selectCursor + 1) % CHARACTERS.length; keys['arrowright'] = false; sound.playMenuSelect(); } if (keys['1']) { p2CharIdx = selectCursor; p2Confirmed = true; keys['1'] = false; sound.playMenuConfirm(); } }
+  if (gameMode === GAME_MODE.LOCAL && p1Confirmed && p2Confirmed) initRound();
+}
+
+function checkRoundEnd() {
+  if (player1.state === 'ko' || player2.state === 'ko') { koTimer++; if (koTimer > 120) { if (player1.state === 'ko') p2Wins++; if (player2.state === 'ko') p1Wins++; if (p1Wins >= 2 || p2Wins >= 2) { gameState = 'victory'; sound.stopBgm(); sound.playVictory(); } else { roundNum++; initRound(); } koTimer = 0; } }
+  if (roundTimer <= 0 && player1.state !== 'ko' && player2.state !== 'ko') { if (player1.hp > player2.hp) { player2.hp = 0; player2.state = 'ko'; p1Wins++; } else if (player2.hp > player1.hp) { player1.hp = 0; player1.state = 'ko'; p2Wins++; } else { p1Wins++; p2Wins++; } if (p1Wins >= 2 || p2Wins >= 2) { gameState = 'victory'; sound.stopBgm(); sound.playVictory(); } else { roundNum++; initRound(); } }
+}
+
+function drawVictory() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)'; ctx.fillRect(0, 0, W, H);
+  let winner = p1Wins >= 2 ? player1.char.name : player2.char.name, wc = p1Wins >= 2 ? '#4488ff' : '#ff4444';
+  if (gameMode === GAME_MODE.ONLINE) { const isWin = (p1Wins >= 2 && onlineState.playerIndex === 0) || (p2Wins >= 2 && onlineState.playerIndex === 1); ctx.fillStyle = isWin ? '#44ff44' : '#ff4444'; ctx.font = 'bold 28px monospace'; ctx.textAlign = 'center'; ctx.fillText(isWin ? '你赢了！' : '你输了...', W/2, H/2 - 80); }
+  ctx.fillStyle = wc; ctx.font = 'bold 48px monospace'; ctx.textAlign = 'center'; ctx.fillText(winner, W/2, H/2 - 30);
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 36px monospace'; ctx.fillText('WIN!', W/2, H/2 + 30);
+  if (Math.sin(Date.now() / 400) > 0) { ctx.fillStyle = '#fff'; ctx.font = '16px monospace'; ctx.fillText('按 ENTER 返回菜单', W/2, H/2 + 80); } ctx.textAlign = 'left';
+}
+
+function gameLoop() {
+  if (slowMotion > 0) { slowMotion--; if (slowMotion % 2 !== 0) { requestAnimationFrame(gameLoop); return; } }
+  if (shakeTimer > 0) { shakeTimer--; shakeX = (Math.random() - 0.5) * shakeTimer * 1.5; shakeY = (Math.random() - 0.5) * shakeTimer * 1.5; } else { shakeX = 0; shakeY = 0; }
+  ctx.save(); ctx.translate(shakeX, shakeY);
+  switch (gameState) {
+    case 'title': drawTitle(); break;
+    case 'modeSelect': updateModeSelect(); drawModeSelect(); break;
+    case 'select': updateSelect(); drawSelect(); break;
+    case 'connect': drawConnect(); break;
+    case 'fight':
+      player1.update(player2); player2.update(player1); checkAttacks(); updateParticles(); checkRoundEnd();
+      if (gameMode === GAME_MODE.ONLINE) {
+        gameFrame++;
+        // 每2帧发送本地玩家的键盘输入给服务器
+        // 在线模式下，双方都使用相同的本地键位 (a/d/w/s/j/k/l/u)
+        // playerIndex 决定哪个角色是本地控制的，哪个是远程控制的
+        if (gameFrame % 2 === 0) {
+          const localInput = {
+            moveLeft: keys['a'],
+            moveRight: keys['d'],
+            jump: keys['w'],
+            crouch: keys['s'],
+            punch: keys['j'],
+            kick: keys['k'],
+            special: keys['l'],
+            block: keys['u']
+          };
+          netClient.sendInput(localInput, gameFrame);
+        }
+      }
+      timerCounter++; if (timerCounter >= 60) { timerCounter = 0; if (roundTimer > 0 && player1.state !== 'ko' && player2.state !== 'ko') roundTimer--; }
+      drawStage(); player1.draw(); player2.draw(); drawParticles(); drawHUD();
+      if (timerCounter < 90 && player1.hp === player1.maxHp && player2.hp === player2.maxHp) { ctx.fillStyle = '#fff'; ctx.font = 'bold 48px monospace'; ctx.textAlign = 'center'; if (timerCounter < 50) ctx.fillText('ROUND ' + roundNum, W/2, H/2); else { ctx.fillStyle = '#ff3333'; ctx.fillText('FIGHT!', W/2, H/2); if (timerCounter === 50) sound.playFight(); } ctx.textAlign = 'left'; }
+      if (player1.state === 'ko' || player2.state === 'ko') { ctx.fillStyle = '#ff0000'; ctx.font = 'bold 72px monospace'; ctx.textAlign = 'center'; ctx.fillText('K.O.', W/2, H/2); ctx.textAlign = 'left'; }
+      break;
+    case 'victory': drawStage(); player1.draw(); player2.draw(); drawHUD(); drawVictory(); break;
+  }
+  ctx.restore(); requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
